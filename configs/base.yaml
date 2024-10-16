@@ -1,0 +1,158 @@
+general:
+  name: TiNSR-${dataset.case_name}-wmask
+  result_dir: ./exp/${general.name}
+  save_list: [./configs, ./datasets, ./models, ./utils, ./systems, ./launch.py]
+  system: TiNSR
+
+dataset:
+  name: dtu
+  root_dir: data/neus/
+  case_name: dtu_scan24
+  img_downscale: 1.0
+  batch_over_images: true
+  background_color: random  # support [white, black, random]
+  apply_mask: true
+  num_workers: 16  # the number of threads for preload
+  val_images: [0, 1]
+model:
+  name: TiNSR
+  geometry:
+    radius: 1.0
+    feature_dim: 16
+    xyz_encoding_config:
+      otype: ProgressiveHashGrid
+      n_levels: 14
+      n_features_per_level: 2
+      log2_hashmap_size: 19
+      base_resolution: 16
+      per_level_scale: 1.452422856114325
+      include_xyz: true
+      start_level: 3
+      start_step: 200
+      update_steps: 200
+    gradient:
+      mode: numerical # support [analytical, numerical]
+      taps: 4
+      fa_mode: tangent # support [average, tangent, none]
+      finest_size_ratio: 1.0
+    mlp_network_config:
+      otype: SDFMLP # VanillaMLP # VanillaMLPCutlass # FullyFusedMLP # VanillaMLP
+      activation: ReLU
+      output_activation: none
+      n_neurons: 64
+      n_hidden_layers: 1
+      sphere_init: true
+      sphere_init_radius: 0.5
+      weight_norm: true
+  variance:
+    init_val: 0.3
+  color:
+    name: volume-radiance
+    radius: ${model.geometry.radius}
+    dir_encoding_config:
+      otype: SphericalHarmonics  # not tcnn's encoder
+      degree: 4
+    mlp_network_config:
+      otype: FullyFusedMLP # VanillaMLP # FullyFusedMLP # LipshitzMLP
+      activation: ReLU
+      output_activation: none # Sigmoid
+      n_neurons: 64
+      n_hidden_layers: 2
+    color_activation: sigmoid
+  background:
+    enabled: False
+    # input_feature_dim: ${add:${model.geometry.feature_dim},3}
+    # xyz_encoding_config:
+    #   otype: Frequency
+    #   n_frequencies: 10
+    # dir_encoding_config:
+    #   otype: SphericalHarmonics  # not tcnn's encoder
+    #   degree: 4
+  render:
+    train_num_rays: 512
+    num_samples_per_ray: 128
+    max_train_num_rays: 300000
+    dynamic_ray_sampling: true
+    cos_anneal_end: ${trainer.max_steps}
+    ray_chunk: 4096 # batch size for rendering the whole image
+    sampler:
+      type: OccGrid
+      scene_aabb: ${model.geometry.radius}
+      resolution: 128
+      levels: 1
+      render_step_size: 4e-3
+      grid_prune: true
+      grid_prune_occ_thre: 1e-2
+    isosurface:
+      resolution: 512
+      threshold: 0.
+      block_size: 64
+      export_color: false
+      cuda: true  
+optimize:
+  loss:
+    rgb_weight: 1.0
+    mask_weight: 0.1
+    eikonal_weight: 0.05
+    # curvture_weight: 0.0 # 1e-5
+    # curvature_warmup_steps: 200
+    # opaque_weight: 0.0
+    # distortion_weight: 0.01
+    adaptive_weight: 1e-3
+    # lipshitz_weight: 3e-6
+    # lipshitz_start_step: 2000
+    sparsity_weight: 2e-4
+    sparsity_scale: 100.0
+  optimizer:
+    name: FusedAdam # AdamW  # FusedAdam
+    args:
+      lr: 0.01
+      betas: [0.9, 0.99]
+      eps: 1.e-15
+      weight_decay: 1e-2
+      amsgrad: false
+    params:
+      geometry:
+        lr: 0.005
+      color:
+        lr: 0.01
+      variance:
+        lr: 0.01
+      geometry_bg:
+        lr: 0.02
+      texture_bg:
+        lr: 0.02
+  warmup_steps: 200
+  scheduler:
+    name: SequentialLR
+    interval: step
+    milestones:
+      - ${optimize.warmup_steps}
+      - 4000 
+      # - 8000
+    schedulers:
+      - name: LinearLR
+        args:
+          start_factor: 0.01
+          end_factor: 1.0
+          total_iters: ${optimize.warmup_steps}
+      - name: ConstantLR
+        args:
+          factor: 1.0
+          total_iters: ${get:${optimize.scheduler.milestones}, 1} # 4000 
+      - name: CosineAnnealingLR
+        args: 
+          T_max: 6000 # ${sub:${trainer.max_steps}, ${get:${optimize.scheduler.milestones}, 1}}
+          eta_min: 0.0005
+checkpoint:
+  save_top_k: -1
+  every_n_train_steps: ${trainer.max_steps}
+
+trainer:
+  max_steps: 10000
+  log_every_n_steps: 100
+  num_sanity_val_steps: 0
+  val_check_interval: 10000 # ${trainer.max_steps}
+  limit_val_batches: ${len:${dataset.val_images}} # 2
+  enable_progress_bar: true
+  precision: 16-mixed #32-true
